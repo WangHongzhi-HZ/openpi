@@ -28,6 +28,8 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import openpi.policies.realman_dual_policy as realman_dual_policy # add realman policy
+import openpi.policies.realman_single_eef_policy as realman_single_eef_policy # add realman single arm policy
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -461,7 +463,83 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+# 新增LeRobotRealmanDataConfig
+@dataclasses.dataclass(frozen=True)
+class LeRobotRealmanDataConfig(DataConfigFactory):
+    """
+    Example data config for custom Realman dataset in LeRobot format.
+    To convert your custom Realman dataset to LeRobot format, see
+    examples/realman/convert_custom_episode_to_lerobot.py
+    """
 
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/left_wrist_image": "left_wrist_image",
+                        "observation/right_wrist_image": "right_wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # Realman converter writes absolute joint+gripper targets in 16D.
+        data_transforms = _transforms.Group(
+            inputs=[realman_dual_policy.RealmanInputs(model_type=model_config.model_type)],
+            outputs=[realman_dual_policy.RealmanOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+# 新增LeRobotRealmanSingleDataConfig
+@dataclasses.dataclass(frozen=True)
+class LeRobotRealmanSingleDataConfig(DataConfigFactory):
+    """
+    Example data config for custom Realman dataset in LeRobot format.
+    To convert your custom Realman dataset to LeRobot format, see
+    examples/realman/convert_custom_episode_to_lerobot.py
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # Realman converter writes absolute joint+gripper targets in 7D.
+        data_transforms = _transforms.Group(
+            inputs=[realman_single_eef_policy.RealmanInputs(model_type=model_config.model_type)],
+            outputs=[realman_single_eef_policy.RealmanOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+        
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -761,6 +839,33 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+
+    TrainConfig(
+        # This config is for fine-tuning pi05 on a custom Realman dataset.
+        # Here, we use LeRobot data format (like for all other fine-tuning examples)
+        # To convert your custom Realman dataset to LeRobot format, see examples/realman/convert_custom_episode_to_lerobot.py
+        name="pi05_realman_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=50,
+        ),
+        data=LeRobotRealmanSingleDataConfig(
+            repo_id="insert_usb_random", #数据集名称
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("./weights/openpi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=4000,
+    ),
+    
     #
     # Fine-tuning Aloha configs.
     #

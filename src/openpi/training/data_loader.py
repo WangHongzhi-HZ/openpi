@@ -138,6 +138,10 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # 替换为本地绝对路径加载
+    #from pathlib import Path
+    #local_dataset_root = Path("/root/private_data/openpi/datasets") / repo_id
+    #dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(local_dir=local_dataset_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={

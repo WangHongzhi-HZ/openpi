@@ -3,6 +3,9 @@ assets/
 checkpoints/
 data/
 wandb/
+35000/
+40000/
+49999/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
