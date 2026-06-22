@@ -1,0 +1,82 @@
+# 转换脚本运行指令
+# 依赖
+uv pip install openpyxl
+# 检查数据有效
+uv run python validate_custom_episodes.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/data_10.9-12 \
+  --output-dir ./validation_output
+#  --verify-open-image 严格检查——打开图像
+
+uv run python convert_custom_episode_to_lerobot.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/data_10.9-12 \
+  --repo-name raw2lerobot0322v1
+
+/data/huggingface_cache/lerobot/raw2lerobot0322v1 数据集质量待review
+47G——>43G
+
+2026.3.26
+uv run python convert_custom_episode_to_lerobot.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/pick_place_dual \
+  --repo-name pick_place_dual_0326
+
+2026.3.27
+uv run python convert_custom_episode_to_lerobot.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/pick_place_dual \
+  --repo-name pick_place_dual_0327_epi56
+
+2026.3.28
+uv run python convert_custom_episode_to_lerobot.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/pick_place_dual_temp \
+  --repo-name pick_place_dual_0328_epi65
+
+2026.4.1
+uv run python convert_custom_episode_to_lerobot.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/pick_place_dual_temp \
+  --repo-name pick_place_dual_0401_epi105
+
+上传数据集
+rayfile-c -a sd5efile.hpccube.com -P 65012 -u aczevmongu -w b1ed11352f815bc4f0-3ea8-4c86-9b58-fe969480e7dd -tm -no-meta -symbolic-links follow -retry 10 -retrytimeout 30 -o upload -d /publichomeaczevmongu -s /data/huggingface_cache/lerobot/pick_place_dual_0401_epi105
+
+计算数据集指标
+uv run scripts/compute_norm_stats.py --config-name pi05_realman_finetune_rl
+
+nohup env XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_realman_finetune --exp-name=pick_place_dual_0326_bs16 --overwrite > logs_pick_place_dual_0326_bs16.log 2>&1 &
+nohup env XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_realman_finetune --exp-name=pick_place_dual_0327_epi56 --keep-period=1 --overwrite > logs_pick_place_dual_0327_epi56.log 2>&1 &
+
+推理
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_realman_finetune --policy.dir=checkpoints/pi05_realman_finetune/pick_place_dual_0326_bs16/19999
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_realman_finetune --policy.dir=checkpoints/pi05_realman_finetune/pick_place_dual_0331_epi65__batch32_step4w/20000
+
+
+uv run examples/simple_client/main.py --env REALMAN_DUAL
+
+uv run examples/realman/inference/client_realman_dual.py
+
+CUDA_VISIBLE_DEVICES=1 uv run scripts/compute_norm_stats.py --config-name pi05_realman_finetune_rl
+CUDA_VISIBLE_DEVICES=0 uv run scripts/train.py pi05_realman_finetune_rl --exp-name=debug_0420_rl --overwrite
+
+
+5.12
+单臂usb插拔
+uv run python convert_custom_episode_to_lerobot_eef.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/insert_usb_v3_cgs \
+  --repo-name insert_usbv3_0512_epi35
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi05_realman_rlt_base
+
+nohup env XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_realman_rlt_base --exp-name=insert_usbv3_0512_epi35_bs4 --overwrite > checkpoints/pi05_realman_rlt_base/insert_usbv3_0512_epi35_bs4.log 2>&1 &
+
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_realman_rlt_base --policy.dir=checkpoints/pi05_realman_rlt_base/20000
+
+uv run python convert_custom_episode_to_lerobot_eef.py \
+  --data-dir /home/ym/data/ym/guisen/guisen/RealMan/RealMan/data/insert_usb_v4 \
+  --repo-name insert_usbv4_0515_epi80
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi05_realman_rlt_base_insert_usb_v4
+
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_realman_rlt_base_insert_usb_v4 --policy.dir=checkpoints/pi05_realman_rlt_base_insert_usb_v4/pi05_realman_rlt_base_insert_usb_v4_exp1/40000
+
+
+
+XLA_FLAGS="--xla_gpu_unsafe_fallback_to_driver_on_ptxas_not_found" uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_realman_finetune --policy.dir=checkpoints/pi05_realman_finetune/insert_usb_random_v2/39999
+uv run examples/realman/inference/client_realman_single.py --port=8000
