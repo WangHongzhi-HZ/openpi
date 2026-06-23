@@ -15,12 +15,17 @@ from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotData
 # ============================================================
 # 1. 数据集配置
 # ============================================================
-# 这里只保留当前真正需要的映射：
+# 映射关系：
 # - 图像命名规则
-# - qpos 列名
-# - gripper 列名
+# - eef 列名 (6维末端位姿)
+# - gripper 列名 (1维夹爪)
+# - force 列名 (6维力/力矩，通过 --use-force 启用)
 #
-# 不再保留 eef/state_map，因为你已经明确不需要 eef 数据。
+# 不启用 force 时 state 维度: eef(6) + gripper(1) = 7 维
+# 启用 force 时 state 维度:   eef(6) + gripper(1) + force(6) = 13 维
+# 其中 force 必须在末尾，因为 force_guidance 通过 state[:, -force_dim:] 提取。
+#
+# ⚠️ 如果你的 xlsx 中力数据列名不同，请修改下方的 force_map。
 # ============================================================
 
 DATASET_CONFIG: dict[str, Any] = {
@@ -42,8 +47,7 @@ DATASET_CONFIG: dict[str, Any] = {
         },
     },
 
-    # 当前真正需要的 state 定义：
-    # 左臂7关节 + 左夹爪1维 + 右臂7关节 + 右夹爪1维 = 16维
+    # 末端位姿: 6 维 EEF pose (x, y, z, roll, pitch, yaw)
     "eef_map": {
         "eef": [
             "right_arm_state_0",
@@ -55,8 +59,22 @@ DATASET_CONFIG: dict[str, Any] = {
         ],
     },
 
+    # 夹爪: 1 维
     "gripper_map": {
         "gripper": "right_arm_gripper",
+    },
+
+    # 力/力矩: 6 维 (fx, fy, fz, tx, ty, tz)，对应 xlsx 中的 right_arm_force_data_0~5
+    # 如果你的力数据在其他列（如 zero_force / tool_zero_force），请修改这里。
+    "force_map": {
+        "force": [
+            "right_arm_force_data_0",
+            "right_arm_force_data_1",
+            "right_arm_force_data_2",
+            "right_arm_force_data_3",
+            "right_arm_force_data_4",
+            "right_arm_force_data_5",
+        ],
     },
 }
 
@@ -70,7 +88,7 @@ def load_rgb_image(image_path: Path) -> np.ndarray:
     return np.array(Image.open(image_path).convert("RGB"))
 
 
-def validate_required_columns(df: pd.DataFrame, config: dict[str, Any]) -> None:
+def validate_required_columns(df: pd.DataFrame, config: dict[str, Any], use_force: bool = False) -> None:
     """检查 xlsx 是否包含当前配置需要的所有列。"""
     required_cols: list[str] = []
 
@@ -80,51 +98,70 @@ def validate_required_columns(df: pd.DataFrame, config: dict[str, Any]) -> None:
     required_cols.extend(config["gripper_map"].values())
     required_cols.append(config["meta"]["frame_id_col"])
 
+    if use_force:
+        for cols in config["force_map"].values():
+            required_cols.extend(cols)
+
     missing = [col for col in required_cols if col not in df.columns]
     if missing:
         raise KeyError(f"xlsx 缺少以下列：{missing}")
 
 
-def build_robot_state_sequence(df: pd.DataFrame, config: dict[str, Any]) -> np.ndarray:
+def build_robot_state_sequence(df: pd.DataFrame, config: dict[str, Any], use_force: bool = False) -> np.ndarray:
     """
     构造机器人状态序列。
 
-    最终 state 定义为：
-        [单臂6维EEF, 夹爪1维]
+    use_force=False (默认):
+        state = [eef(6), gripper(1)]  → 7 维
 
-    因此每一帧 state 维度为 7。
+    use_force=True (ForceVLA):
+        state = [eef(6), gripper(1), force(6)]  → 13 维
+        force 维度在末尾，供 force_guidance 通过 state[:, -force_dim:] 提取。
     """
     eef = df[config["eef_map"]["eef"]].to_numpy(dtype=np.float32)
-
     gripper = df[[config["gripper_map"]["gripper"]]].to_numpy(dtype=np.float32)
 
-    state_seq = np.concatenate(
-        [eef, gripper],
-        axis=1,
-    )
+    parts = [eef, gripper]
+
+    if use_force:
+        force = df[config["force_map"]["force"]].to_numpy(dtype=np.float32)
+        force = np.nan_to_num(force, nan=0.0)  # 清洗传感器 NaN，防止污染 norm stats 和训练
+        parts.append(force)
+
+    state_seq = np.concatenate(parts, axis=1)
     return state_seq
 
 
-def build_state_action_pairs(sequence: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def build_state_action_pairs(
+    sequence: np.ndarray,
+    action_dim: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     用时序错位法构造 state-actions 对。
 
     规则：
         state_t    = sequence[t]
-        actions_t  = sequence[t+1]
+        actions_t  = sequence[t+1][:action_dim]
 
     输入：
-        sequence: [T, D]
+        sequence:   [T, D]  完整状态序列（可能包含力数据）
+        action_dim: 动作维度，为 None 时使用全部维度。
 
     输出：
         states:  [T-1, D]
-        actions: [T-1, D]
+        actions: [T-1, A]  其中 A = action_dim or D
     """
     if len(sequence) < 2:
         raise ValueError("帧数少于 2,无法构造 state-actions 对。")
 
     states = sequence[:-1]
-    actions = sequence[1:]
+    raw_actions = sequence[1:]
+
+    if action_dim is not None:
+        actions = raw_actions[:, :action_dim]
+    else:
+        actions = raw_actions
+
     return states, actions
 
 
@@ -156,6 +193,7 @@ def build_image_paths(
 def infer_image_shape_from_episode(
     episode_dir: Path,
     config: dict[str, Any],
+    use_force: bool = False,
 ) -> dict[str, tuple[int, int, int]]:
     """
     从某个 episode 中自动推断图像的 shape。
@@ -165,7 +203,7 @@ def infer_image_shape_from_episode(
         raise FileNotFoundError(f"找不到 xlsx 文件：{xlsx_path}")
 
     df = pd.read_excel(xlsx_path)
-    validate_required_columns(df, config)
+    validate_required_columns(df, config, use_force=use_force)
 
     first_frame_id = int(df.iloc[0][config["meta"]["frame_id_col"]])
 
@@ -178,7 +216,7 @@ def infer_image_shape_from_episode(
     return shapes
 
 
-def iter_aligned_frames(episode_dir: Path, config: dict[str, Any]):
+def iter_aligned_frames(episode_dir: Path, config: dict[str, Any], use_force: bool = False):
     """
     读取一个 episode，生成可直接写入 LeRobot 的逐帧样本。
 
@@ -194,19 +232,25 @@ def iter_aligned_frames(episode_dir: Path, config: dict[str, Any]):
             img0, img1, ..., img_{T-2}
 
     因此最终有效样本数为 T-1。
+
+    use_force=False: state(7维), actions(7维)
+    use_force=True:  state(13维=eef+gripper+force), actions(7维=仅本体感知)
     """
     xlsx_path = episode_dir / "episode_data.xlsx"
     if not xlsx_path.exists():
         raise FileNotFoundError(f"找不到 xlsx 文件：{xlsx_path}")
 
     df = pd.read_excel(xlsx_path)
-    validate_required_columns(df, config)
+    validate_required_columns(df, config, use_force=use_force)
 
-    # 构造基于 qpos + gripper 的 16维状态序列
-    state_seq = build_robot_state_sequence(df, config)
+    # 构造状态序列（use_force 时包含力数据）
+    state_seq = build_robot_state_sequence(df, config, use_force=use_force)
 
     # 用时序错位法构造 state/actions
-    states, actions = build_state_action_pairs(state_seq)
+    # use_force 时，actions 只取前 7 维（本体感知），不含力数据
+    proprioceptive_dim = 7  # eef(6) + gripper(1)
+    action_dim = proprioceptive_dim if use_force else None
+    states, actions = build_state_action_pairs(state_seq, action_dim=action_dim)
 
     # 构造图像路径
     image_paths = build_image_paths(df, episode_dir, config)
@@ -249,9 +293,13 @@ def find_episode_dirs(data_root: Path, include: list[str] | None = None) -> list
 
 def create_lerobot_features(
     image_shapes: dict[str, tuple[int, int, int]],
+    use_force: bool = False,
 ) -> dict[str, Any]:
     """
     根据图像 shape 构造 LeRobot 的 features 定义。
+
+    use_force=False: state(7,), actions(7,)
+    use_force=True:  state(13,), actions(7,)
     """
     features: dict[str, Any] = {}
 
@@ -262,14 +310,15 @@ def create_lerobot_features(
             "names": ["height", "width", "channel"],
         }
 
-    # 7维：
-    # 单臂7关节 + 夹爪1维
+    state_dim = 13 if use_force else 7  # eef(6) + gripper(1) + force(6)|0
+
     features["state"] = {
         "dtype": "float32",
-        "shape": (7,),
+        "shape": (state_dim,),
         "names": ["state"],
     }
 
+    # 动作永远是 7 维（只有本体感知，力是传感器数据不能作为控制目标）
     features["actions"] = {
         "dtype": "float32",
         "shape": (7,),
@@ -287,6 +336,7 @@ def main(
     data_dir: str,
     repo_name: str = "",
     include: list[str] | None = None,
+    use_force: bool = False,
     push_to_hub: bool = False,
     clear_output: bool = True,
     resume: bool = False,
@@ -313,6 +363,8 @@ def main(
 
     resume: True 时跳过已完成和已跳过的 episode，追加未处理的。
     include: 需要转换的子目录名称列表。为 None 时转换所有。
+    use_force: True 时从 xlsx 中提取力/力矩数据，追加到 state 末尾（7→13维），
+              供 ForceVLA (pi0.5 + force_guidance) 使用。
     """
     import datetime
 
@@ -357,7 +409,7 @@ def main(
     image_shapes = None
     for ep_dir in episode_dirs:  # 从全部 episode 中推断 shape（不限于 pending）
         try:
-            image_shapes = infer_image_shape_from_episode(ep_dir, DATASET_CONFIG)
+            image_shapes = infer_image_shape_from_episode(ep_dir, DATASET_CONFIG, use_force=use_force)
             break
         except Exception as e:
             print(f"[WARN] 跳过损坏的 episode (用于推断shape): {ep_dir}, 错误: {e}")
@@ -365,7 +417,11 @@ def main(
         raise RuntimeError("无法从任何 episode 推断图像尺寸，所有 episode 可能都已损坏")
 
     # 构造 features
-    features = create_lerobot_features(image_shapes)
+    features = create_lerobot_features(image_shapes, use_force=use_force)
+
+    print(f"[INFO] use_force = {use_force}")
+    print(f"[INFO] state 维度 = {features['state']['shape'][0]}")
+    print(f"[INFO] actions 维度 = {features['actions']['shape'][0]}")
 
     # 如果需要（非续传且 clear_output），先删除旧输出
     if clear_output and output_path.exists() and not resume:
@@ -413,7 +469,7 @@ def main(
             print(f"[INFO] 正在转换 episode: {episode_dir}")
 
             frame_count_this_episode = 0
-            for frame in iter_aligned_frames(episode_dir, DATASET_CONFIG):
+            for frame in iter_aligned_frames(episode_dir, DATASET_CONFIG, use_force=use_force):
                 dataset.add_frame(frame)
                 frame_count_this_episode += 1
 
@@ -455,9 +511,10 @@ def main(
         print(f"[INFO] 跳过日志已保存到: {log_path}")
     print(f"[INFO] 数据已保存到 = {output_path}")
 
+    tag_extra = ["force"] if use_force else []
     if push_to_hub:
         dataset.push_to_hub(
-            tags=["custom", "single-arm","eef", "robot", "vision"],
+            tags=["custom", "single-arm", "eef", "robot", "vision"] + tag_extra,
             private=False,
             push_videos=True,
             license="apache-2.0",

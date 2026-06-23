@@ -114,7 +114,7 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI0_FORCE:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -125,7 +125,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
-            case _model.ModelType.PI05:
+            case _model.ModelType.PI05 | _model.ModelType.PI05_FORCE:
                 assert isinstance(model_config, pi0_config.Pi0Config)
                 return _transforms.Group(
                     inputs=[
@@ -186,7 +186,7 @@ class DataConfigFactory(abc.ABC):
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            use_quantile_norm=model_config.model_type not in (ModelType.PI0, ModelType.PI0_FORCE),
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -847,7 +847,7 @@ _CONFIGS = [
         name="pi05_realman_finetune",
         model=pi0_config.Pi0Config(
             pi05=True,
-            paligemma_variant="gemma_2b_lora", 
+            paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             action_horizon=50,
         ),
@@ -857,13 +857,47 @@ _CONFIGS = [
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            paligemma_variant="gemma_2b_lora", 
+            paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader("./weights/openpi05_base/params"),
         num_train_steps=40_000,
         batch_size=64,
         save_interval=4000,
+    ),
+
+    TrainConfig(
+        # This config is for fine-tuning pi05 + ForceVLA (force guidance) on a custom Realman dataset
+        # with force/torque sensor data.
+        # State format: [ee_xyz(3), ee_rpy(3), gripper(1), fx, fy, fz, tx, ty, tz(6)] = 13 dims → padded to action_dim=32
+        # The force/torque data (last 6 dims) is extracted by the model and fused with VLM output via LIMoE.
+        name="pi05_force_realman_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            force_guidance=True,             # 启用 ForceVLA 力引导
+            force_dim=6,                     # 力/力矩维度: fx, fy, fz, tx, ty, tz
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=50,
+        ),
+        data=LeRobotRealmanSingleDataConfig(
+            repo_id="realman_insert_usb_forcedata",      # 替换为你的数据集名称
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            force_guidance=True,             # 与 model 保持一致
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # 从 pi05 base checkpoint 加载权重，force_in_proj 和 limoe 层将随机初始化
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./weights/openpi05_base/params",
+            extra_missing_regex=".*force_in_proj.*|.*limoe.*"
+        ),
+        num_train_steps=50_000,
+        batch_size=16,                       # 可根据显存调整
+        #save_interval=4000,
     ),
     
     #

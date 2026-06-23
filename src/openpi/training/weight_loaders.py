@@ -46,12 +46,17 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # 额外的缺失 key 正则：checkpoint 中不存在的层（如 force_in_proj, limoe）会被保留为随机初始化
+    extra_missing_regex: str = ""
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing LoRA weights and any extra layers.
+        missing_regex = ".*lora.*"
+        if self.extra_missing_regex:
+            missing_regex += "|" + self.extra_missing_regex
+        return _merge_params(loaded_params, params, missing_regex=missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

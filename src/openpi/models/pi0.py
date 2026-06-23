@@ -67,6 +67,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.force_guidance = config.force_guidance
+        self.force_dim = config.force_dim
+        self.force_start_index = config.force_start_index
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -98,6 +101,21 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # Force guidance (ForceVLA): project force/torque data and fuse with VLM output via LIMoE.
+        if self.force_guidance:
+            import openpi.models.limoe_simple as _limoe
+            self.force_in_proj = nnx.Linear(config.force_dim, paligemma_config.width, rngs=rngs)
+            self.limoe = nnx_bridge.ToNNX(
+                _limoe.LIMoEBlock(
+                    mlp_dim=paligemma_config.width,
+                    num_experts=4,
+                    num_top_k=1,
+                    num_heads=paligemma_config.num_heads,
+                    out_dim=action_expert_config.width,
+                )
+            )
+            self.limoe.lazy_init(jnp.zeros((32, 200, paligemma_config.width)), True, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -144,6 +162,7 @@ class Pi0(_model.BaseModel):
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b 1 fem"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -183,7 +202,17 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask, adarms_cond
+
+        # Force guidance: extract force/torque data from state[force_start : force_start + force_dim].
+        # State layout: [prio(force_start_index dims), force(force_dim dims), padding...], padded to action_dim.
+        if self.force_guidance:
+            force_slice = obs.state[:, self.force_start_index : self.force_start_index + self.force_dim]
+            # 防御 NaN（来自传感器异常），避免 NaN 通过 force_in_proj → LIMoE → loss 传播导致训练崩溃
+            force_slice = jnp.nan_to_num(force_slice, nan=0.0)
+            force_tokens = self.force_in_proj(force_slice)[:, None, :]
+        else:
+            force_tokens = None
+        return tokens, input_mask, ar_mask, adarms_cond, force_tokens
 
     @override
     def compute_loss(
@@ -201,7 +230,7 @@ class Pi0(_model.BaseModel):
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, force_tokens = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -209,7 +238,12 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        if self.force_guidance:
+            # Fuse VLM prefix output with force tokens via LIMoE, then add action expert output.
+            limoe_out = self.limoe(jnp.concatenate([prefix_out, force_tokens], axis=1))
+            v_t = self.action_out_proj(limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :])
+        else:
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -234,11 +268,11 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out_fix, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, force_tokens = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
@@ -266,7 +300,12 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            if self.force_guidance:
+                # Fuse VLM prefix output with force tokens via LIMoE, then add action expert output.
+                limoe_out = self.limoe(jnp.concatenate([prefix_out_fix, force_tokens], axis=1))
+                v_t = self.action_out_proj(limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :])
+            else:
+                v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt
 

@@ -1,0 +1,236 @@
+================================================================================
+ForceVLA 集成到 Pi0.5 — 完整改动记录
+日期: 2026-06-22
+最后修订: 2026-06-23 (flaxformer/aqt 解耦 + weight_loader 扩展 + NaN 全链路防护)
+================================================================================
+
+一、新增文件 (3)
+--------------------------------------------------------------------------------
+
+1. src/openpi/models/limoe_simple.py
+   来源: ForceVLA/src/openpi/models/limoe_simple.py
+   说明: LIMoE (Linear Input Mixture of Experts) 模块，Encoder + MoE + 输出投影。
+   依赖: flaxformer 包 (见下方)
+
+2. src/flaxformer/ (整个目录，132个.py文件)
+   来源: ForceVLA/flaxformer/
+   放置位置: src/flaxformer/ (与 src/openpi/ 同级)
+   LIMoE 需要的模块:
+         - flaxformer.types
+         - flaxformer.components.dense (MlpBlock)  ← 已修改，aqt 懒加载
+         - flaxformer.architectures.moe.routing (TokensChooseScatterRouter)
+         - flaxformer.architectures.moe.scatter_utils
+
+3. 新增 pip 依赖: aqtp==0.9.0 (Google Accurate Quantized Training)
+   实际不需要导入，但因 flaxformer/dense.py 的类型注解引用 aqt.QuantOps，
+   uv 会解析该依赖。已通过 from __future__ import annotations 规避运行时导入。
+
+
+二、修改文件 (12)
+--------------------------------------------------------------------------------
+
+### 2.1 src/openpi/models/model.py
+
+  class ModelType(enum.Enum):
+      PI0 = "pi0"
+      PI0_FAST = "pi0_fast"
+      PI05 = "pi05"
++     PI0_FORCE = "pi0_force"
++     PI05_FORCE = "pi05_force"
+
+
+### 2.2 src/openpi/models/pi0_config.py
+
+  新增三个配置字段:
+
++ force_guidance: bool = False   # 启用 ForceVLA 力引导
++ force_dim: int = 6             # 力/力矩维度
++ force_start_index: int = 7     # 力数据在 state 中的起始索引 (前7维=本体感知)
+
+  model_type 属性更新:
+      PI05_FORCE if self.pi05 and self.force_guidance else ...
+
+
+### 2.3 src/openpi/models/pi0.py (核心改动 — 5 处)
+
+  改动 A: __init__ — force 相关属性 + 条件创建 force_in_proj / limoe
+      self.force_guidance / self.force_dim / self.force_start_index
+      if self.force_guidance: (lazy import limoe_simple → force_in_proj + limoe)
+
+  改动 B: embed_suffix — 返回值新增第 5 个元素 force_tokens
+      force_slice = state[:, force_start:force_start+force_dim]
+      force_slice = jnp.nan_to_num(force_slice, nan=0.0)  ← NaN 防御
+      force_tokens = force_in_proj(force_slice)[:, None, :]
+
+  改动 C: compute_loss — LIMoE 融合
+      limoe_out = limoe(concat([prefix_out, force_tokens]))
+      v_t = action_out_proj(limoe_out[:, -horizon:] + suffix_out[:, -horizon:])
+
+  改动 D: sample_actions — 推理时使用 prefix_out_fix 进行 LIMoE 融合
+      (prefix_out_fix, _), kv_cache = llm([prefix, None], ...)
+      limoe(concat([prefix_out_fix, force_tokens]))  ← 修复原版 bug
+
+  改动 E: embed_suffix NaN 防御 (同 B，jnp.nan_to_num)
+
+
+### 2.4 src/openpi/policies/droid_policy.py
+
+  match: PI0 | PI05 | PI0_FORCE | PI05_FORCE
+
+### 2.5 src/openpi/policies/realman_dual_policy.py
+
+  同上
+
+### 2.6 src/openpi/policies/realman_single_eef_policy.py
+
+  同上
+
+### 2.7 src/openpi/training/config.py
+
+  改动 A: ModelTransformFactory match 新增 PI0_FORCE / PI05_FORCE
+  改动 B: use_quantile_norm = model_type not in (PI0, PI0_FORCE)
+  改动 C: 新增训练配置 pi05_force_realman_finetune (含 extra_missing_regex)
+
+### 2.8 scripts/compute_norm_stats.py
+
+  统计前 np.nan_to_num(arr, nan=0.0)，防止 NaN 污染 RunningStats。
+
+### 2.9 convert_custom2lerobot_single_eef.py
+
+  转换时 np.nan_to_num(force, nan=0.0)，源头清洗传感器 NaN。
+
+### 2.10 src/openpi/training/weight_loaders.py
+
+  CheckpointWeightLoader 新增 extra_missing_regex 字段:
+      checkpoint 中不存在的层（force_in_proj, limoe）被标记为随机初始化，
+      不参与结构校验，由模型的随机初始值代替。
+
+### 2.11 src/flaxformer/components/dense.py
+
+  改动: from __future__ import annotations 延迟类型注解求值
+        + aqt 导入改为懒加载 (仅 use_aqt=True 时才 import)
+  原因: flaxformer 需要 aqt 类型注解，但 LIMoE 不使用量化 (use_aqt=False)，
+        避免引入 tensorflow 等重型依赖。
+
+### 2.12 /home/ym-gpu-3/.cache/.../episodes_stats.jsonl
+
+  修复: 672 个 NaN → 0.0 (LeRobot 数据集元数据，NaN 不是合法 JSON)
+  原因: 原始传感器 NaN 经转换脚本写入 episodes_stats.jsonl，导致 LeRobot 加载崩溃。
+
+
+================================================================================
+三、训练配置 (pi05_force_realman_finetune)
+================================================================================
+
+  TrainConfig(
+      name="pi05_force_realman_finetune",
+      model=pi0_config.Pi0Config(
+          pi05=True,
+          force_guidance=True,
+          force_dim=6,
+          force_start_index=7,
+          paligemma_variant="gemma_2b_lora",
+          action_expert_variant="gemma_300m_lora",
+          action_horizon=50,
+      ),
+      data=LeRobotRealmanSingleDataConfig(
+          repo_id="realman_insert_usb_forcedata",
+          base_config=DataConfig(prompt_from_task=True),
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+          pi05=True, force_guidance=True,
+          paligemma_variant="gemma_2b_lora",
+          action_expert_variant="gemma_300m_lora",
+      ).get_freeze_filter(),
+      weight_loader=weight_loaders.CheckpointWeightLoader(
+          "./weights/openpi05_base/params",
+          extra_missing_regex=".*force_in_proj.*|.*limoe.*"
+      ),
+      num_train_steps=50_000,
+      batch_size=16,
+  )
+
+  训练命令:
+    WANDB_MODE=disabled XLA_FLAGS="--xla_gpu_unsafe_fallback_to_driver_on_ptxas_not_found" \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+      uv run scripts/train.py pi05_force_realman_finetune --exp-name=insert_usb_force --overwrite
+
+
+================================================================================
+四、数据流 (Pi0.5 + ForceVLA)
+================================================================================
+
+  训练 (compute_loss):
+    1. embed_prefix: 图像(SigLIP) → tokens + 离散 prompt (含 prio state)
+    2. embed_suffix: 噪声动作 + time → adaRMS_cond
+       + state[:, 7:13] → nan_to_num → force_in_proj → force_tokens
+    3. LLM: [prefix, suffix], adarms → (prefix_out, suffix_out)
+    4. LIMoE: concat([prefix_out, force_tokens]) → MoE → limoe_out
+    5. 输出: action_out_proj(limoe_out[:, -horizon:] + suffix_out[:, -horizon:])
+    6. Loss: MSE(v_t - u_t), u_t = noise - actions
+
+  推理 (sample_actions):
+    1. prefix → prefix_out_fix + kv_cache
+    2. while_loop (t=1→0):
+       a. suffix + force_tokens
+       b. LLM with kv_cache → suffix_out
+       c. LIMoE(prefix_out_fix, force_tokens) → limoe_out
+       d. v_t = action_out_proj(limoe_out + suffix_out)
+       e. x_{t+dt} = x_t + dt * v_t
+    3. 返回 x_0
+
+
+================================================================================
+五、已修复的问题 (5)
+================================================================================
+
+问题 1: Force 切片位置错误 (state[:, -force_dim:] → padding 零)
+  修复: 新增 force_start_index 字段，使用显式索引 state[:, 7:13]
+
+问题 2: 原版 ForceVLA 推理 bug (pi0_force.py:338 使用 prefix_out=None 拼接)
+  修复: 使用外层捕获的 prefix_out_fix
+
+问题 3: 原始 NaN force 值 → norm_stats null → 训练崩溃 (全链路)
+  修复:
+    a. convert_custom2lerobot_single_eef.py: np.nan_to_num (源头)
+    b. compute_norm_stats.py: np.nan_to_num (统计)
+    c. pi0.py embed_suffix: jnp.nan_to_num (训练/推理)
+    d. episodes_stats.jsonl: NaN→0.0 (LeRobot 元数据修复)
+
+问题 4: flaxformer/dense.py 硬依赖 aqt (Google量化库) → import 链断裂
+  修复: from __future__ import annotations + aqt 懒加载 (use_aqt=False 时无需)
+
+问题 5: CheckpointWeightLoader 拒绝含新层的模型结构
+  修复: 新增 extra_missing_regex 字段，标记 force_in_proj/limoe 为随机初始化
+
+问题 6 (已知，不处理): TokenizePrompt 将 force 也 tokenize 到离散 prompt
+  LIMoE 信号强度 >> 离散 token，不影响收敛。
+
+问题 7 (已知): 数据集中 force dim 2 (fz) 含极端值 -40.57
+  quantile normalization 自动压到 [q01, q99] 区间，不影响训练。
+
+
+================================================================================
+六、向后兼容
+================================================================================
+
+- force_guidance=False: 完全等同于原版 pi0/pi05
+- LIMoE/force_in_proj 仅在 force_guidance=True 时创建 (延迟 import)
+- extra_missing_regex 为空时 weight_loader 行为不变
+- 现有 checkpoint 可正常加载
+
+
+================================================================================
+七、Pi0 vs Pi0.5 vs Pi0.5+ForceVLA 对比
+================================================================================
+
+特性                    Pi0            Pi0.5          Pi0.5+ForceVLA
+----------------------------------------------------------------------
+state 输入方式          连续 (suffix)   离散 (prompt)   离散 (prompt) + force (LIMoE)
+时间嵌入                拼接 action     adaRMSNorm      adaRMSNorm
+state_proj              ✓              ✗               ✗
+time_mlp                ✗              ✓               ✓
+force_in_proj           ✗              ✗               ✓ (Linear 6→paligemma_width)
+limoe                   ✗              ✗               ✓ (Encoder+MoE)
+action head 输入        suffix_out     suffix_out      limoe_out + suffix_out
+max_token_len           48             200             200

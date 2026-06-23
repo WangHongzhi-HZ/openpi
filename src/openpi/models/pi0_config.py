@@ -29,6 +29,13 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # Force guidance (ForceVLA): fuses force/torque sensor data with VLM prefix output via a LIMoE block.
+    # When enabled, the force data is extracted from state[:, force_start_index : force_start_index + force_dim].
+    force_guidance: bool = False
+    # Dimension of the force/torque input.
+    force_dim: int = 6
+    # Starting index of force/torque data in the state vector (default 7: after 7-dim prio state).
+    force_start_index: int = 7
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
@@ -51,8 +58,8 @@ class Pi0Config(_model.BaseModelConfig):
     @override
     def model_type(self) -> _model.ModelType:
         if self.pi05:
-            return _model.ModelType.PI05
-        return _model.ModelType.PI0
+            return _model.ModelType.PI05_FORCE if self.force_guidance else _model.ModelType.PI05
+        return _model.ModelType.PI0_FORCE if self.force_guidance else _model.ModelType.PI0
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":

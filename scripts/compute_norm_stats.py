@@ -193,7 +193,11 @@ def main(config_name: str, max_frames: int | None = None):
                 )
 
             arr = np.asarray(batch[key])
-            print(f"DEBUG: batch {i}, {key}_shape={arr.shape}", flush=True)
+            # 过滤 NaN，避免 RunningStats 被污染
+            nan_mask = np.isnan(arr)
+            if np.any(nan_mask):
+                print(f"WARNING: batch {i}, {key} contains {np.sum(nan_mask)} NaN values, replacing with 0.0", flush=True)
+                arr = np.nan_to_num(arr, nan=0.0)
             stats[key].update(arr)
 
     if seen_batches == 0:
@@ -205,6 +209,18 @@ def main(config_name: str, max_frames: int | None = None):
     print(f"DEBUG: finished stats computation, seen_batches={seen_batches}", flush=True)
 
     norm_stats = {key: running_stats.get_statistics() for key, running_stats in stats.items()}
+
+    # 调试：打印 get_statistics 的原始值（JSON 序列化前）
+    for key, s in norm_stats.items():
+        print(f"DEBUG: {key} mean before JSON: {s.mean}")
+        print(f"DEBUG: {key} std before JSON: {s.std}")
+        print(f"DEBUG: {key} q01 before JSON: {s.q01}")
+        print(f"DEBUG: {key} q99 before JSON: {s.q99}")
+        # 检查 force 维度
+        if s.mean is not None and len(s.mean) > 7:
+            force_mean = s.mean[7:13]
+            force_std = s.std[7:13] if s.std is not None else None
+            print(f"DEBUG: {key} force[7:13] mean={force_mean}, std={force_std}")
 
     output_path = config.assets_dirs / data_config.repo_id
     output_path.mkdir(parents=True, exist_ok=True)
