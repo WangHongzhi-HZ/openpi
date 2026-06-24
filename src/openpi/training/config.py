@@ -876,27 +876,27 @@ _CONFIGS = [
             pi05=True,
             force_guidance=True,             # 启用 ForceVLA 力引导
             force_dim=6,                     # 力/力矩维度: fx, fy, fz, tx, ty, tz
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
+            #paligemma_variant="gemma_2b_lora",
+            #action_expert_variant="gemma_300m_lora",
             action_horizon=50,
         ),
         data=LeRobotRealmanSingleDataConfig(
             repo_id="realman_insert_usb_forcedata",      # 替换为你的数据集名称
             base_config=DataConfig(prompt_from_task=True),
         ),
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            force_guidance=True,             # 与 model 保持一致
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
+       # freeze_filter=pi0_config.Pi0Config(
+       #     pi05=True,
+       #     force_guidance=True,             # 与 model 保持一致
+       #     paligemma_variant="gemma_2b_lora",
+       #     action_expert_variant="gemma_300m_lora",
+       # ).get_freeze_filter(),
         # 从 pi05 base checkpoint 加载权重，force_in_proj 和 limoe 层将随机初始化
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "./weights/openpi05_base/params",
             extra_missing_regex=".*force_in_proj.*|.*limoe.*"
         ),
         num_train_steps=50_000,
-        batch_size=16,                       # 可根据显存调整
+        batch_size=48,                       # 可根据显存调整
         #save_interval=4000,
     ),
     
