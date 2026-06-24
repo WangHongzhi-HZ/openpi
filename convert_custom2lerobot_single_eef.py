@@ -125,7 +125,10 @@ def build_robot_state_sequence(df: pd.DataFrame, config: dict[str, Any], use_for
 
     if use_force:
         force = df[config["force_map"]["force"]].to_numpy(dtype=np.float32)
-        force = np.nan_to_num(force, nan=0.0)  # 清洗传感器 NaN，防止污染 norm stats 和训练
+        # 用前一个非 NaN 值填充力信息中的 NaN（forward fill），避免传感器瞬断导致的数据丢失
+        force_df = pd.DataFrame(force)
+        force_df = force_df.ffill().fillna(0.0)  # 开头无前值的 NaN 补 0.0
+        force = force_df.to_numpy(dtype=np.float32)
         parts.append(force)
 
     state_seq = np.concatenate(parts, axis=1)

@@ -193,11 +193,14 @@ def main(config_name: str, max_frames: int | None = None):
                 )
 
             arr = np.asarray(batch[key])
-            # 过滤 NaN，避免 RunningStats 被污染
+            # 用前一个非 NaN 值填充 NaN（forward fill），避免传感器瞬断导致的数据丢失
             nan_mask = np.isnan(arr)
             if np.any(nan_mask):
-                print(f"WARNING: batch {i}, {key} contains {np.sum(nan_mask)} NaN values, replacing with 0.0", flush=True)
-                arr = np.nan_to_num(arr, nan=0.0)
+                print(f"WARNING: batch {i}, {key} contains {np.sum(nan_mask)} NaN values, forward filling", flush=True)
+                import pandas as pd
+                arr_df = pd.DataFrame(arr)
+                arr_df = arr_df.ffill().fillna(0.0)  # 开头无前值的 NaN 补 0.0
+                arr = arr_df.to_numpy(dtype=arr.dtype)
             stats[key].update(arr)
 
     if seen_batches == 0:

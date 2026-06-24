@@ -1,7 +1,7 @@
 ================================================================================
 ForceVLA 集成到 Pi0.5 — 完整改动记录
 日期: 2026-06-22
-最后修订: 2026-06-23 (flaxformer/aqt 解耦 + weight_loader 扩展 + NaN 全链路防护)
+最后修订: 2026-06-23 (NaN 处理改为 forward fill: 用前一个非 NaN 值填充，传感器瞬断时避免跳变到 0)
 ================================================================================
 
 一、新增文件 (3)
@@ -59,8 +59,7 @@ ForceVLA 集成到 Pi0.5 — 完整改动记录
 
   改动 B: embed_suffix — 返回值新增第 5 个元素 force_tokens
       force_slice = state[:, force_start:force_start+force_dim]
-      force_slice = jnp.nan_to_num(force_slice, nan=0.0)  ← NaN 防御
-      force_tokens = force_in_proj(force_slice)[:, None, :]
+      force_slice = jnp.nan_to_num(force_slice, nan=0.0)  ← NaN 防御（兜底；时序 forward fill 在上游完成）
 
   改动 C: compute_loss — LIMoE 融合
       limoe_out = limoe(concat([prefix_out, force_tokens]))
@@ -71,6 +70,8 @@ ForceVLA 集成到 Pi0.5 — 完整改动记录
       limoe(concat([prefix_out_fix, force_tokens]))  ← 修复原版 bug
 
   改动 E: embed_suffix NaN 防御 (同 B，jnp.nan_to_num)
+      注：模型层 state 为单帧 (batch, state_dim)，无时间轴，无法做 forward fill。
+      时序 forward fill 已在数据预处理（convert & compute_norm_stats）中完成。
 
 
 ### 2.4 src/openpi/policies/droid_policy.py
@@ -93,11 +94,13 @@ ForceVLA 集成到 Pi0.5 — 完整改动记录
 
 ### 2.8 scripts/compute_norm_stats.py
 
-  统计前 np.nan_to_num(arr, nan=0.0)，防止 NaN 污染 RunningStats。
+  统计前对 NaN 做 forward fill (pd.DataFrame.ffill)，防止 NaN 污染 RunningStats。
+  开头无前值的 NaN → 0.0。
 
 ### 2.9 convert_custom2lerobot_single_eef.py
 
-  转换时 np.nan_to_num(force, nan=0.0)，源头清洗传感器 NaN。
+  转换时对力数据做 forward fill (pd.DataFrame.ffill)，沿时间轴用前一个非 NaN 值填充。
+  开头无前值的 NaN → 0.0。避免传感器瞬断时数据跳变到 0。
 
 ### 2.10 src/openpi/training/weight_loaders.py
 
@@ -163,7 +166,7 @@ ForceVLA 集成到 Pi0.5 — 完整改动记录
   训练 (compute_loss):
     1. embed_prefix: 图像(SigLIP) → tokens + 离散 prompt (含 prio state)
     2. embed_suffix: 噪声动作 + time → adaRMS_cond
-       + state[:, 7:13] → nan_to_num → force_in_proj → force_tokens
+       + state[:, 7:13] → (上游已 forward fill) → nan_to_num 兜底 → force_in_proj → force_tokens
     3. LLM: [prefix, suffix], adarms → (prefix_out, suffix_out)
     4. LIMoE: concat([prefix_out, force_tokens]) → MoE → limoe_out
     5. 输出: action_out_proj(limoe_out[:, -horizon:] + suffix_out[:, -horizon:])
@@ -191,10 +194,10 @@ ForceVLA 集成到 Pi0.5 — 完整改动记录
   修复: 使用外层捕获的 prefix_out_fix
 
 问题 3: 原始 NaN force 值 → norm_stats null → 训练崩溃 (全链路)
-  修复:
-    a. convert_custom2lerobot_single_eef.py: np.nan_to_num (源头)
-    b. compute_norm_stats.py: np.nan_to_num (统计)
-    c. pi0.py embed_suffix: jnp.nan_to_num (训练/推理)
+  修复 (2026-06-23 更新: 改为 forward fill，避免传感器瞬断跳变到 0):
+    a. convert_custom2lerobot_single_eef.py: pd.DataFrame.ffill 沿时间轴向前填充 (源头)
+    b. compute_norm_stats.py: pd.DataFrame.ffill (统计，残存 NaN 兜底)
+    c. pi0.py embed_suffix: jnp.nan_to_num (训练/推理 — 单帧无时间轴，仅兜底)
     d. episodes_stats.jsonl: NaN→0.0 (LeRobot 元数据修复)
 
 问题 4: flaxformer/dense.py 硬依赖 aqt (Google量化库) → import 链断裂

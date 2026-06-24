@@ -207,7 +207,9 @@ class Pi0(_model.BaseModel):
         # State layout: [prio(force_start_index dims), force(force_dim dims), padding...], padded to action_dim.
         if self.force_guidance:
             force_slice = obs.state[:, self.force_start_index : self.force_start_index + self.force_dim]
-            # 防御 NaN（来自传感器异常），避免 NaN 通过 force_in_proj → LIMoE → loss 传播导致训练崩溃
+            # 防御性 NaN 清洗：此处 state 为单帧 (batch, state_dim)，无时间轴，无法做 forward fill。
+            # 时序上的 forward fill 已在数据预处理（convert 脚本 & compute_norm_stats）中完成，
+            # 此处仅做最后的 0.0 兜底，防止异常 NaN 通过 force_in_proj → LIMoE → loss 传播导致训练崩溃。
             force_slice = jnp.nan_to_num(force_slice, nan=0.0)
             force_tokens = self.force_in_proj(force_slice)[:, None, :]
         else:
